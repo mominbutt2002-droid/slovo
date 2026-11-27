@@ -1,0 +1,127 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --brand-ink: #031725;
+  --brand-navy: #022E5B;
+  --brand-sky: #499BED;
+  --brand-ice: #A1C6F6;
+  --brand-frost: #DAEAFF;
+
+  /* Light theme shadcn semantic tokens */
+  --background: #F6FAFF;
+  --foreground: #031725;
+  --card: #FFFFFF;
+  --card-foreground: #031725;
+  --surface-muted: #EAF3FF;
+  --primary: #022E5B;
+  --primary-foreground: #FFFFFF;
+  --secondary: #DAEAFF;
+  --secondary-foreground: #031725;
+  --muted: #DAEAFF;
+  --muted-foreground: #2A4B6C;
+  --accent: #499BED;
+  --accent-foreground: #FFFFFF;
+  --border: #C4DCF8;
+  --input: #B5D2F5;
+  --ring: #499BED;
+}
+
+.dark {
+  /* Dark theme shadcn semantic tokens */
+  --background: #031725;
+  --foreground: #EBF4FF;
+  --card: #072038;
+  --card-foreground: #EBF4FF;
+  --surface-muted: #022E5B;
+  --primary: #499BED;
+  --primary-foreground: #031725;
+  --secondary: #022E5B;
+  --secondary-foreground: #DAEAFF;
+  --muted: #0B2A48;
+  --muted-foreground: #A1C6F6;
+  --accent: #499BED;
+  --accent-foreground: #031725;
+  --border: rgba(161, 198, 246, 0.2);
+  --input: rgba(161, 198, 246, 0.28);
+  --ring: #499BED;
+}
+
+@theme inline {
+  --font-display: "Geologica", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-sans: "Cormorant SC", Georgia, serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-surface-muted: var(--surface-muted);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    background-color: var(--background);
+    color: var(--foreground);
+    font-size: 16px;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    font-weight: 500;
+    line-height: 1.6;
+    letter-spacing: 0.01em;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-display);
+    text-wrap: balance;
+    letter-spacing: -0.02em;
+  }
+
+  button, a, input, textarea, select {
+    transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+  }
+}
+
+.font-heading {
+  font-family: var(--font-display);
+}
+
+.font-body {
+  font-family: var(--font-sans);
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(73, 155, 237, 0.3);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(73, 155, 237, 0.5);
+}

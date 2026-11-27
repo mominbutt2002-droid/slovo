@@ -1,0 +1,6 @@
+{
+  "name": "ФактБаза",
+  "description": "SaaS-сервис персонального AI-репетитора по русскому языку с этапами обучения, практикой грамматики, правописания, speaking, listening, проверкой произношения и подпиской через Stripe.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
