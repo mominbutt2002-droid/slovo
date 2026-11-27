@@ -2,7 +2,6 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import Stripe from 'stripe';
 import {
@@ -87,10 +86,16 @@ function validateAndCreateBooking(input: {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = 3000;
-const TUTOR_TEXT_MODEL = 'gemini-3.1-flash-lite';
+const PORT = Number(process.env.PORT) || 3000;
+const TUTOR_TEXT_MODEL = process.env.GEMINI_MODEL?.trim() || 'gemini-3.1-flash-lite';
+const TEXT_MODEL_FALLBACKS = [
+  TUTOR_TEXT_MODEL,
+  'gemini-3.1-flash-lite-preview',
+  'gemini-2.5-flash',
+].filter((m, idx, arr) => Boolean(m) && arr.indexOf(m) === idx);
 const TTS_MODEL = 'gemini-3.8-flash-lite-tts';
 const TRANSCRIBE_MODEL = 'gemini-3.5-transcribe';
+const TRANSCRIBE_FALLBACKS = [TRANSCRIBE_MODEL, 'gemini-2.5-flash'];
 
 const VALID_LEVELS = new Set(['beginner', 'intermediate', 'advanced', 'expert']);
 
@@ -162,6 +167,37 @@ async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
   throw lastErr;
 }
 
+function isModelNotFoundError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes('404') || msg.includes('NOT_FOUND') || msg.includes('not found');
+}
+
+async function generateContentWithFallback(
+  ai: GoogleGenAI,
+  models: string[],
+  params: Omit<Parameters<GoogleGenAI['models']['generateContent']>[0], 'model'>
+) {
+  let lastErr: unknown;
+  for (let i = 0; i < models.length; i++) {
+    const model = models[i];
+    try {
+      return await withRetry(() =>
+        ai.models.generateContent({
+          ...params,
+          model,
+        })
+      );
+    } catch (err) {
+      lastErr = err;
+      if (!isModelNotFoundError(err) || i === models.length - 1) {
+        throw err;
+      }
+      console.warn(`Model ${model} unavailable on this endpoint, falling back to ${models[i + 1]}`);
+    }
+  }
+  throw lastErr;
+}
+
 function mapApiError(err: unknown): { status: number; message: string } {
   const raw = err instanceof Error ? err.message : String(err);
   if (raw.includes('GEMINI_API_KEY')) {
@@ -221,9 +257,17 @@ async function generateRussianTtsWav(ai: GoogleGenAI, text: string, style?: stri
   return ttsRes.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data ?? null;
 }
 
-async function startServer() {
+export function createApiApp(): express.Express {
   const app = express();
   app.use(express.json({ limit: '14mb' }));
+
+  app.get('/api/health', (_req, res) => {
+    res.json({
+      ok: true,
+      geminiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
+      stripeConfigured: Boolean(process.env.STRIPE_SECRET_KEY?.trim()),
+    });
+  });
 
   // 1. AI Russian Tutor Chat (Grammar, Spelling, General Practice, Speaking Dialog)
   app.post('/api/tutor/chat', async (req, res) => {
@@ -281,36 +325,33 @@ async function startServer() {
       const prompt = `${recentHistory ? `Контекст диалога:\n${recentHistory}\n\n` : ''}Сообщение ученика:\n${cleanMessage}`;
 
       const ai = getAiClient();
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: TUTOR_TEXT_MODEL,
-          contents: prompt,
-          config: {
-            systemInstruction,
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                reply: { type: Type.STRING, description: 'Ответ репетитора на русском языке.' },
-                corrections: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      original: { type: Type.STRING },
-                      corrected: { type: Type.STRING },
-                      rule: { type: Type.STRING },
-                    },
-                    required: ['original', 'corrected', 'rule'],
+      const response = await generateContentWithFallback(ai, TEXT_MODEL_FALLBACKS, {
+        contents: prompt,
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              reply: { type: Type.STRING, description: 'Ответ репетитора на русском языке.' },
+              corrections: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    original: { type: Type.STRING },
+                    corrected: { type: Type.STRING },
+                    rule: { type: Type.STRING },
                   },
+                  required: ['original', 'corrected', 'rule'],
                 },
-                tip: { type: Type.STRING, description: 'Короткий совет или следующий вопрос ученику.' },
               },
-              required: ['reply', 'corrections', 'tip'],
+              tip: { type: Type.STRING, description: 'Короткий совет или следующий вопрос ученику.' },
             },
+            required: ['reply', 'corrections', 'tip'],
           },
-        })
-      );
+        },
+      });
 
       let parsed: {
         reply?: string;
@@ -362,43 +403,40 @@ async function startServer() {
       const safeTopic = typeof topic === 'string' && topic.trim() ? topic.trim().slice(0, 120) : 'базовые правила уровня';
 
       const ai = getAiClient();
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: TUTOR_TEXT_MODEL,
-          contents: `Составь 4 интерактивных вопроса-задачи по русскому языку.
+      const response = await generateContentWithFallback(ai, TEXT_MODEL_FALLBACKS, {
+        contents: `Составь 4 интерактивных вопроса-задачи по русскому языку.
 Уровень: ${LEVEL_DESCRIPTIONS[safeLevel]}
 Направление: ${safeFocus}
 Тема: ${safeTopic}
 
 Каждый вопрос должен иметь ровно 4 варианта ответа (options), индекс правильного варианта correctIndex (0..3) и краткое понятное объяснение правила (explanation).`,
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                title: { type: Type.STRING },
-                questions: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      prompt: { type: Type.STRING },
-                      options: {
-                        type: Type.ARRAY,
-                        items: { type: Type.STRING },
-                      },
-                      correctIndex: { type: Type.INTEGER },
-                      explanation: { type: Type.STRING },
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              title: { type: Type.STRING },
+              questions: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    prompt: { type: Type.STRING },
+                    options: {
+                      type: Type.ARRAY,
+                      items: { type: Type.STRING },
                     },
-                    required: ['prompt', 'options', 'correctIndex', 'explanation'],
+                    correctIndex: { type: Type.INTEGER },
+                    explanation: { type: Type.STRING },
                   },
+                  required: ['prompt', 'options', 'correctIndex', 'explanation'],
                 },
               },
-              required: ['title', 'questions'],
             },
+            required: ['title', 'questions'],
           },
-        })
-      );
+        },
+      });
 
       const parsed = JSON.parse((response.text ?? '{}').trim()) as {
         title?: string;
@@ -439,43 +477,40 @@ async function startServer() {
       const safeLevel = typeof level === 'string' && VALID_LEVELS.has(level) ? level : 'intermediate';
 
       const ai = getAiClient();
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: TUTOR_TEXT_MODEL,
-          contents: `Проведи глубокий филологический разбор ошибок в русском тексте для ученика (${LEVEL_DESCRIPTIONS[safeLevel]}).
+      const response = await generateContentWithFallback(ai, TEXT_MODEL_FALLBACKS, {
+        contents: `Проведи глубокий филологический разбор ошибок в русском тексте для ученика (${LEVEL_DESCRIPTIONS[safeLevel]}).
 Текст ученика:
 """
 ${cleanText}
 """
 
 Верни исправленный текст (correctedText), общую оценку грамотности от 0 до 100 (score), краткий вывод (summary) и список конкретных ошибок (errors) с категорией (Орфография / Пунктуация / Грамматика / Стилистика), неверным фрагментом, правильным вариантом и подробным правилом.`,
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                score: { type: Type.INTEGER },
-                correctedText: { type: Type.STRING },
-                summary: { type: Type.STRING },
-                errors: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      category: { type: Type.STRING },
-                      fragment: { type: Type.STRING },
-                      correction: { type: Type.STRING },
-                      explanation: { type: Type.STRING },
-                    },
-                    required: ['category', 'fragment', 'correction', 'explanation'],
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              score: { type: Type.INTEGER },
+              correctedText: { type: Type.STRING },
+              summary: { type: Type.STRING },
+              errors: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    category: { type: Type.STRING },
+                    fragment: { type: Type.STRING },
+                    correction: { type: Type.STRING },
+                    explanation: { type: Type.STRING },
                   },
+                  required: ['category', 'fragment', 'correction', 'explanation'],
                 },
               },
-              required: ['score', 'correctedText', 'summary', 'errors'],
             },
+            required: ['score', 'correctedText', 'summary', 'errors'],
           },
-        })
-      );
+        },
+      });
 
       const parsed = JSON.parse((response.text ?? '{}').trim());
       return res.json(parsed);
@@ -495,40 +530,37 @@ ${cleanText}
         typeof topic === 'string' && topic.trim() ? topic.trim().slice(0, 100) : 'жизнь, культура и работа';
 
       const ai = getAiClient();
-      const scriptRes = await withRetry(() =>
-        ai.models.generateContent({
-          model: TUTOR_TEXT_MODEL,
-          contents: `Создай короткий аутентичный монолог или историю на русском языке для аудирования (Listening), объёмом 3–5 предложений.
+      const scriptRes = await generateContentWithFallback(ai, TEXT_MODEL_FALLBACKS, {
+        contents: `Создай короткий аутентичный монолог или историю на русском языке для аудирования (Listening), объёмом 3–5 предложений.
 Уровень: ${LEVEL_DESCRIPTIONS[safeLevel]}
 Тема: ${safeTopic}
 
 Также составь 3 вопроса на понимание прослушанного с 4 вариантами ответа, правильным индексом (0..3) и пояснением.`,
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                title: { type: Type.STRING },
-                transcript: { type: Type.STRING },
-                questions: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      prompt: { type: Type.STRING },
-                      options: { type: Type.ARRAY, items: { type: Type.STRING } },
-                      correctIndex: { type: Type.INTEGER },
-                      explanation: { type: Type.STRING },
-                    },
-                    required: ['prompt', 'options', 'correctIndex', 'explanation'],
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              title: { type: Type.STRING },
+              transcript: { type: Type.STRING },
+              questions: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    prompt: { type: Type.STRING },
+                    options: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    correctIndex: { type: Type.INTEGER },
+                    explanation: { type: Type.STRING },
                   },
+                  required: ['prompt', 'options', 'correctIndex', 'explanation'],
                 },
               },
-              required: ['title', 'transcript', 'questions'],
             },
+            required: ['title', 'transcript', 'questions'],
           },
-        })
-      );
+        },
+      });
 
       const parsed = JSON.parse((scriptRes.text ?? '{}').trim()) as {
         title?: string;
@@ -598,24 +630,21 @@ ${cleanText}
       const cleanTarget = typeof targetPhrase === 'string' ? targetPhrase.trim().slice(0, 400) : '';
 
       const ai = getAiClient();
-      const transcribeRes = await withRetry(() =>
-        ai.models.generateContent({
-          model: TRANSCRIBE_MODEL,
-          contents: {
-            parts: [
-              {
-                inlineData: {
-                  mimeType: safeMime,
-                  data: audioBase64,
-                },
+      const transcribeRes = await generateContentWithFallback(ai, TRANSCRIBE_FALLBACKS, {
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                mimeType: safeMime,
+                data: audioBase64,
               },
-              {
-                text: 'Транскрибируй эту русскую речь максимально точно, передавая реально произнесённые слова и окончания без автоисправления ошибок говорящего.',
-              },
-            ],
-          },
-        })
-      );
+            },
+            {
+              text: 'Транскрибируй эту русскую речь максимально точно, передавая реально произнесённые слова и окончания без автоисправления ошибок говорящего.',
+            },
+          ],
+        },
+      });
 
       const transcript = (transcribeRes.text ?? '').trim();
       if (!transcript) {
@@ -624,10 +653,8 @@ ${cleanText}
         });
       }
 
-      const evalRes = await withRetry(() =>
-        ai.models.generateContent({
-          model: TUTOR_TEXT_MODEL,
-          contents: `Оцени произношение и точность речи ученика по русскому языку (${LEVEL_DESCRIPTIONS[safeLevel]}).
+      const evalRes = await generateContentWithFallback(ai, TEXT_MODEL_FALLBACKS, {
+        contents: `Оцени произношение и точность речи ученика по русскому языку (${LEVEL_DESCRIPTIONS[safeLevel]}).
 ${cleanTarget ? `Эталонная фраза: «${cleanTarget}»` : 'Свободная речь ученика.'}
 Распознанная речь ученика: «${transcript}»
 
@@ -637,32 +664,31 @@ ${cleanTarget ? `Эталонная фраза: «${cleanTarget}»` : 'Своб�
 - stressGuide: эталонная или исправленная фраза с проставленными знаками ударения (например: здрАвствуйте, звонИт)
 - feedback: краткий конструктивный разбор произношения, ударений и редукции гласных
 - issues: массив конкретных замечаний (слово, что исправить)`,
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                score: { type: Type.INTEGER },
-                transcript: { type: Type.STRING },
-                stressGuide: { type: Type.STRING },
-                feedback: { type: Type.STRING },
-                issues: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      word: { type: Type.STRING },
-                      note: { type: Type.STRING },
-                    },
-                    required: ['word', 'note'],
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              score: { type: Type.INTEGER },
+              transcript: { type: Type.STRING },
+              stressGuide: { type: Type.STRING },
+              feedback: { type: Type.STRING },
+              issues: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    word: { type: Type.STRING },
+                    note: { type: Type.STRING },
                   },
+                  required: ['word', 'note'],
                 },
               },
-              required: ['score', 'transcript', 'stressGuide', 'feedback', 'issues'],
             },
+            required: ['score', 'transcript', 'stressGuide', 'feedback', 'issues'],
           },
-        })
-      );
+        },
+      });
 
       const evaluated = JSON.parse((evalRes.text ?? '{}').trim());
       return res.json({
@@ -833,44 +859,41 @@ ${catalogContext}
       const prompt = `${recentHistory ? `История диалога:\n${recentHistory}\n\n` : ''}Новое сообщение клиента:\n${cleanMessage}`;
 
       const ai = getAiClient();
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: TUTOR_TEXT_MODEL,
-          contents: prompt,
-          config: {
-            systemInstruction,
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                reply: {
-                  type: Type.STRING,
-                  description: 'Структурированный ответ AI-агента строго по справочнику школы.',
-                },
-                openBookingForm: {
-                  type: Type.BOOLEAN,
-                  description: 'Открыть ли форму записи прямо в чате.',
-                },
-                readyToConfirm: {
-                  type: Type.BOOLEAN,
-                  description: 'True только если клиент уже указал имя, контакт и удобный день/время для записи.',
-                },
-                bookingDraft: {
-                  type: Type.OBJECT,
-                  properties: {
-                    studentName: { type: Type.STRING },
-                    contact: { type: Type.STRING },
-                    serviceTitle: { type: Type.STRING },
-                    teacherName: { type: Type.STRING },
-                    preferredDayTime: { type: Type.STRING },
-                  },
+      const response = await generateContentWithFallback(ai, TEXT_MODEL_FALLBACKS, {
+        contents: prompt,
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              reply: {
+                type: Type.STRING,
+                description: 'Структурированный ответ AI-агента строго по справочнику школы.',
+              },
+              openBookingForm: {
+                type: Type.BOOLEAN,
+                description: 'Открыть ли форму записи прямо в чате.',
+              },
+              readyToConfirm: {
+                type: Type.BOOLEAN,
+                description: 'True только если клиент уже указал имя, контакт и удобный день/время для записи.',
+              },
+              bookingDraft: {
+                type: Type.OBJECT,
+                properties: {
+                  studentName: { type: Type.STRING },
+                  contact: { type: Type.STRING },
+                  serviceTitle: { type: Type.STRING },
+                  teacherName: { type: Type.STRING },
+                  preferredDayTime: { type: Type.STRING },
                 },
               },
-              required: ['reply', 'openBookingForm', 'readyToConfirm', 'bookingDraft'],
             },
+            required: ['reply', 'openBookingForm', 'readyToConfirm', 'bookingDraft'],
           },
-        })
-      );
+        },
+      });
 
       let parsed: {
         reply?: string;
@@ -958,6 +981,12 @@ ${catalogContext}
     return res.status(201).json({ booking: result.booking });
   });
 
+  return app;
+}
+
+async function startServer() {
+  const app = createApiApp();
+
   if (process.env.NODE_ENV === 'production') {
     const distPath = path.resolve(__dirname, 'dist');
     app.use(express.static(distPath));
@@ -965,6 +994,7 @@ ${catalogContext}
       res.sendFile(path.join(distPath, 'index.html'));
     });
   } else {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -977,4 +1007,6 @@ ${catalogContext}
   });
 }
 
-startServer();
+if (!process.env.VERCEL) {
+  startServer();
+}
